@@ -147,7 +147,7 @@ def print_status_info(user_info):
         user_info: 用户信息字典
     """
     portal_info = user_info.get("portalOnlineUserInfo", {})
-    online_info = user_info.get("onlineUser", {})
+    online_info = user_info.get("onlineUser") or {}
     
     username = portal_info.get("userName") or portal_info.get("userId")
     service = portal_info.get("service")

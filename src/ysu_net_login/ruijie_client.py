@@ -103,12 +103,20 @@ class RuijieClient:
         Returns:
             包含sessionId等参数的字典
         """
-        resp = self.client.get(redirect_url, allow_redirects=True, proxies=self.proxies)
-        
-        # 处理JavaScript重定向
-        if "location.href=" in resp.text:
+        resp = self.client.get(redirect_url, allow_redirects=True, proxies=self.proxies, timeout=15)
+
+        # 处理JavaScript重定向（最多重试两轮）
+        for _ in range(2):
+            if "location.href=" not in resp.text:
+                break
             redirect_url_2 = resp.text.split("'")[1].split("'")[0]
-            resp = self.client.get(redirect_url_2, allow_redirects=True, proxies=self.proxies)
+            # 登出后服务端可能把页面指向哑地址（如 http://124.124.124.124），
+            # 此时不要跟随，改为重新访问入口
+            if "auth1.ysu.edu.cn" in redirect_url_2:
+                resp = self.client.get(redirect_url_2, allow_redirects=True, proxies=self.proxies, timeout=15)
+            else:
+                self._log(f"Ignoring dead portal redirect: {redirect_url_2}")
+                resp = self.client.get(redirect_url, allow_redirects=True, proxies=self.proxies, timeout=15)
         
         if "portal-main" not in resp.request.url:
             raise Exception(f"Portal redirection failed. Expected URL to contain 'portal-main', but got: {resp.request.url}")
@@ -144,7 +152,7 @@ class RuijieClient:
         )
         
         node_resp = response.json()
-        current_node = node_resp['data'].get('currentNodePath', 'Unknown')
+        current_node = (node_resp.get('data') or {}).get('currentNodePath', 'Unknown')
         self._log(f"Current Node: {current_node}")
         
         return node_resp
@@ -429,18 +437,74 @@ class RuijieClient:
             tuple: (is_logged_in, user_info_or_redirect_url)
         """
         try:
-            user_info = self.get_online_user_info()
-            redirect_url = user_info["portalOnlineUserInfo"].get("redirectUrl")
-            
-            if redirect_url:
-                # 未登录
-                return False, redirect_url
-            else:
+            # 新版 eportal 使用伪造的 sessionId 查询会被判定为
+            # dx.failed.user.offline，必须先走一次 portal 重定向拿真实 sessionId
+            try:
+                session_info = self.redirect_to_portal()
+                session_id = session_info.get('sessionId', '114514')
+            except Exception as e:
+                self._log(f"Failed to get portal session, fallback to default: {e}")
+                session_info, session_id = {}, '114514'
+
+            is_online, user_info = self._query_online_status(session_info)
+            portal_user = user_info.get("portalOnlineUserInfo", {})
+            redirect_url = portal_user.get("redirectUrl")
+
+            if is_online:
                 # 已登录
                 return True, user_info
+            else:
+                # 未登录
+                return False, redirect_url
         except Exception as e:
             self._log(f"Error checking login status: {e}")
             return False, None
+
+    def _query_online_status(self, session_info):
+        """
+        查询当前是否在线。
+
+        不同 NAS 的行为不一致：
+        - 宿舍区：portalOnlineUserInfo 查询成功时 result=success 且带 userId
+        - 教学区 Ruijie：portalOnlineUserInfo 可能返回 result=fail，
+         但 network/userOnline 仍然返回 online=true
+
+        Returns:
+            tuple: (is_online, user_info)
+        """
+        session_id = session_info.get('sessionId', '114514')
+        user_info = self.get_online_user_info(session_id)
+        portal_user = user_info.get("portalOnlineUserInfo") or {}
+        redirect_url = portal_user.get("redirectUrl")
+
+        is_online = (
+            portal_user.get("result") == "success"
+            and portal_user.get("userId")
+            and not redirect_url
+        )
+
+        if not is_online:
+            try:
+                online_status = self.user_online(session_info)
+                is_online = bool(online_status.get("online"))
+            except Exception as e:
+                self._log(f"userOnline check failed: {e}")
+                # 兜底：portal 会话参数里直接带 userOnline=true
+                is_online = str(session_info.get("userOnline", "")).lower() == "true"
+
+        # 在线但 portalOnlineUserInfo 没有用户名时（教学区 NAS），
+        # 尝试用账号信息补全，方便 status 展示
+        if is_online and not portal_user.get("userName"):
+            try:
+                account = self.get_account_info(session_info) or {}
+                if account.get("name"):
+                    portal_user["userName"] = account["name"]
+                if account.get("service"):
+                    portal_user["service"] = account["service"]
+            except Exception as e:
+                self._log(f"getAccountInfo failed: {e}")
+
+        return is_online, user_info
     
     def get_available_services(self, username, password):
         """
@@ -493,32 +557,52 @@ class RuijieClient:
             bool: 登录是否成功
         """
         try:
-            # 1. 检查当前状态
-            is_logged_in, info = self.check_login_status()
-            if is_logged_in:
-                self._log("Already logged in")
-                return True
-
-            # 2. 重定向到门户获取会话信息
+            # 1. 重定向到门户获取会话信息（并用真实 sessionId 检查在线状态）
             session_info = self.redirect_to_portal()
             self._log(f"Got session info: {session_info}")
+            is_online, user_info = self._query_online_status(session_info)
+            portal_user = user_info.get('portalOnlineUserInfo') or {}
+            current_user_id = portal_user.get('userId')
+            if is_online:
+                current_user = portal_user.get('userName', 'unknown')
+                current_service = portal_user.get('service') or 'unknown'
+                if not current_user_id or current_user_id == username:
+                    self._log(f"Already logged in as {current_user} ({current_service})")
+                    return True
+                # 教学区等共享出口 IP 的网段，portalOnlineUserInfo 显示的
+                # 可能是同网段其他账号，因此只提示、不阻断
+                print(
+                    f"提示: 当前网络已在线（服务器显示账号 {current_user} / {current_service}）。"
+                    f"如需确保切换到 {username} / {service}，请先执行 ysunetlogin logout 后重新登录。"
+                )
+                return True
 
-            # 3. 通过cas-sso直接登录
+            # 2. 通过cas-sso直接登录
             self.cas_sso_login(username, password, session_info)
             
-            # 5. 获取服务列表
+            # 3. 获取服务列表
             services = self.service_selection(session_info)
             self._log(f"Available services: {services}")
             
-            # 6. 登录到指定服务
+            # 4. 登录到指定服务
             login_result = self.service_login(session_info, service)
             self._log(f"Service login result: {login_result}")
-            
-            # 7. 验证登录状态
+
+            # 5. 验证登录状态
             online_status = self.user_online(session_info)
             self._log(f"User online status: {online_status}")
+
+            # 6. 已在线但工作流已结束时，服务端会返回 workFlowNode is empty；
+            #    此时只要实际在线即视为成功
+            if (
+                login_result.get('code') != 200
+                and 'workflownode is empty' in str(login_result.get('message', '')).lower()
+                and online_status.get('online', False)
+            ):
+                self._log("Workflow already finished and user is online, treating as success")
+                return True
             
-            # 8. 检查认证结果
+            # 7. 检查认证结果
             if login_result.get('code') == 200 and login_result.get('data'):
                 auth_result = login_result['data'].get('authResult')
                 if auth_result == 'fail':
@@ -529,7 +613,7 @@ class RuijieClient:
             else:
                 raise Exception(f"Invalid service login response: {login_result}")
             
-            # 9. 检查在线状态
+            # 8. 检查在线状态
             if not online_status.get('online', False):
                 error_message = online_status.get('message', 'User is not online after authentication')
                 raise Exception(f"Login verification failed: {error_message}")
@@ -549,21 +633,21 @@ class RuijieClient:
             bool: 登出是否成功
         """
         try:
-            # 1. 检查当前状态
-            is_logged_in, info = self.check_login_status()
+            # 1. 重定向到门户获取会话信息（并用真实 sessionId 检查在线状态，
+            #    否则会误判“已登出”导致根本不会调用 offline）
+            session_info = self.redirect_to_portal()
+            self._log(f"Got session info for logout: {session_info}")
+
+            is_logged_in, user_info = self._query_online_status(session_info)
             if not is_logged_in:
                 self._log("Already logged out")
                 return True
             
-            # 2. 重定向到门户获取会话信息
-            session_info = self.redirect_to_portal()
-            self._log(f"Got session info for logout: {session_info}")
-            
-            # 3. 执行登出
+            # 2. 执行登出
             offline_result = self.offline(session_info)
             self._log(f"Offline result: {offline_result}")
             
-            # 4. 验证登出状态
+            # 3. 验证登出状态
             final_status = self.user_online(session_info)
             self._log(f"Final user status: {final_status}")
             
